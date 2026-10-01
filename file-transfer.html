@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickShare – File Transfer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root{--bg:#f4f6fb;--card:#fff;--text:#1c2333;--muted:#6b7385;--accent:#4f46e5;--border:#e2e6f0;--ok:#16a34a}
+  @media(prefers-color-scheme:dark){:root{--bg:#0f1220;--card:#181c2e;--text:#eef0f8;--muted:#98a0b8;--border:#2a3048}}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text);
+       min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+  .card{background:var(--card);width:100%;max-width:440px;border-radius:20px;padding:24px;border:1px solid var(--border);
+        box-shadow:0 10px 30px rgba(0,0,0,.08)}
+  h1{margin:0 0 4px;font-size:22px} p.sub{margin:0 0 18px;color:var(--muted);font-size:14px}
+  .drop{border:2px dashed var(--border);border-radius:14px;padding:28px 12px;text-align:center;cursor:pointer;color:var(--muted);transition:.2s}
+  .drop.over,.drop:hover{border-color:var(--accent);color:var(--accent)}
+  button{width:100%;margin-top:14px;padding:12px;border:0;border-radius:12px;background:var(--accent);color:#fff;
+         font-size:15px;font-weight:600;cursor:pointer} button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--accent);border:1px solid var(--border);margin-top:8px}
+  .file{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:8px 0;border-bottom:1px solid var(--border)}
+  .file span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .file span:last-child{color:var(--muted);white-space:nowrap}
+  .bar{height:6px;background:var(--border);border-radius:6px;overflow:hidden;margin-top:6px}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .1s}
+  #qr{display:flex;justify-content:center;margin:18px 0 10px} #qr img,#qr canvas{border-radius:10px;background:#fff;padding:10px}
+  .code{text-align:center;font-family:monospace;font-size:20px;letter-spacing:3px;font-weight:700}
+  .status{text-align:center;font-size:13px;color:var(--muted);margin-top:8px}
+  .hidden{display:none} a.dl{color:var(--ok);font-weight:600;text-decoration:none}
+  input[type=text]{width:100%;padding:11px;border-radius:12px;border:1px solid var(--border);background:transparent;color:var(--text);font-size:15px;margin-top:14px;text-align:center}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📁 QuickShare</h1>
+  <p class="sub">Send files directly device-to-device. No upload, no account.</p>
+
+  <!-- SEND VIEW -->
+  <div id="sendView">
+    <div class="drop" id="drop">Tap or drop files here</div>
+    <input type="file" id="picker" multiple hidden>
+    <div id="sendList"></div>
+    <button id="genBtn" disabled>Generate QR code</button>
+
+    <div id="shareBox" class="hidden">
+      <div id="qr"></div>
+      <div class="code" id="codeText"></div>
+      <div class="status" id="sendStatus">Waiting for receiver to scan…</div>
+      <button class="ghost" id="copyBtn">Copy link</button>
+      <input type="text" id="manual" placeholder="Receiver: or enter code here" class="hidden">
+    </div>
+    <button class="ghost" id="toReceive">I want to receive with a code</button>
+  </div>
+
+  <!-- RECEIVE VIEW -->
+  <div id="recvView" class="hidden">
+    <input type="text" id="codeInput" placeholder="Enter code (e.g. ab12cd)">
+    <button id="connectBtn">Connect &amp; receive</button>
+    <div class="status" id="recvStatus"></div>
+    <div id="recvList"></div>
+    <button class="ghost" id="toSend">← Back to send</button>
+  </div>
+</div>
+
+<script>
+const PREFIX = 'qshare-';
+const CHUNK = 64 * 1024;
+const $ = id => document.getElementById(id);
+const fmt = b => b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB';
+let files = [], peer = null;
+
+/* ---------- SEND ---------- */
+$('drop').onclick = () => $('picker').click();
+$('picker').onchange = e => addFiles(e.target.files);
+['dragover','dragleave','drop'].forEach(ev => $('drop').addEventListener(ev, e => {
+  e.preventDefault(); $('drop').classList.toggle('over', ev === 'dragover');
+  if (ev === 'drop') addFiles(e.dataTransfer.files);
+}));
+
+function addFiles(list){
+  files = files.concat([...list]);
+  $('sendList').innerHTML = files.map((f,i) =>
+    `<div class="file"><span>${esc(f.name)}</span><span>${fmt(f.size)}</span></div>
+     <div class="bar"><i id="sb${i}"></i></div>`).join('');
+  $('genBtn').disabled = !files.length;
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+$('genBtn').onclick = () => {
+  const id = Math.random().toString(36).slice(2, 8);
+  $('genBtn').disabled = true;
+  peer = new Peer(PREFIX + id);
+  peer.on('open', () => {
+    const url = location.href.split('#')[0] + '#' + id;
+    $('shareBox').classList.remove('hidden');
+    $('qr').innerHTML = '';
+    new QRCode($('qr'), {text: url, width: 200, height: 200});
+    $('codeText').textContent = id;
+    $('copyBtn').onclick = () => navigator.clipboard.writeText(url).then(() => $('copyBtn').textContent = 'Copied ✓');
+  });
+  peer.on('connection', conn => {
+    conn.on('open', async () => {
+      $('sendStatus').textContent = 'Receiver connected – sending…';
+      for (let i = 0; i < files.length; i++) await sendFile(conn, files[i], i);
+      $('sendStatus').textContent = 'All files sent ✓ (keep this page open for more receivers)';
+    });
+  });
+  peer.on('error', e => $('sendStatus').textContent = 'Error: ' + e.type);
+};
+
+async function sendFile(conn, file, idx){
+  conn.send({t:'meta', name:file.name, size:file.size, type:file.type, idx});
+  let offset = 0;
+  while (offset < file.size){
+    const buf = await file.slice(offset, offset + CHUNK).arrayBuffer();
+    conn.send({t:'chunk', idx, buf});
+    offset += buf.byteLength;
+    $('sb'+idx).style.width = (offset / file.size * 100) + '%';
+    while (conn.dataChannel && conn.dataChannel.bufferedAmount > 8e6) await new Promise(r => setTimeout(r, 50));
+  }
+  conn.send({t:'done', idx});
+}
+
+/* ---------- RECEIVE ---------- */
+const parts = {};
+function receive(code){
+  code = code.trim().toLowerCase();
+  if (!code) return;
+  $('recvStatus').textContent = 'Connecting…';
+  const p = new Peer();
+  p.on('open', () => {
+    const conn = p.connect(PREFIX + code, {reliable:true});
+    conn.on('open', () => $('recvStatus').textContent = 'Connected – receiving…');
+    conn.on('data', d => {
+      if (d.t === 'meta'){
+        parts[d.idx] = {meta:d, chunks:[], got:0};
+        $('recvList').insertAdjacentHTML('beforeend',
+          `<div class="file"><span>${esc(d.name)}</span><span id="rs${d.idx}">${fmt(d.size)}</span></div>
+           <div class="bar"><i id="rb${d.idx}"></i></div>`);
+      } else if (d.t === 'chunk'){
+        const f = parts[d.idx]; f.chunks.push(d.buf); f.got += d.buf.byteLength;
+        $('rb'+d.idx).style.width = (f.got / f.meta.size * 100) + '%';
+      } else if (d.t === 'done'){
+        const f = parts[d.idx];
+        const url = URL.createObjectURL(new Blob(f.chunks, {type:f.meta.type}));
+        $('rs'+d.idx).innerHTML = `<a class="dl" href="${url}" download="${esc(f.meta.name)}">Save ⬇</a>`;
+        $('rs'+d.idx).firstChild.click();   // auto-download
+        $('recvStatus').textContent = 'Received ✓';
+      }
+    });
+    conn.on('error', () => $('recvStatus').textContent = 'Connection failed');
+  });
+  p.on('error', e => $('recvStatus').textContent = 'Error: ' + e.type + ' – check the code');
+}
+$('connectBtn').onclick = () => receive($('codeInput').value);
+
+/* ---------- VIEW SWITCHING ---------- */
+const show = recv => { $('sendView').classList.toggle('hidden', recv); $('recvView').classList.toggle('hidden', !recv); };
+$('toReceive').onclick = () => show(true);
+$('toSend').onclick = () => show(false);
+
+// Opened from QR code → auto-receive
+if (location.hash.length > 1){
+  show(true);
+  const c = location.hash.slice(1);
+  $('codeInput').value = c;
+  receive(c);
+}
+</script>
+</body>
+</html>
